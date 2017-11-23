@@ -23,8 +23,11 @@ module internal Utils =
         req.rawForm |> getString |> fromJson<'a>
 
 open Argu
+open System.Net
 
 let start (commands: Commands) (args: ParseResults<Options.CLIArguments>) =
+    let port = args.GetResult (<@ Options.CLIArguments.Port @>, defaultValue = 8088)
+    let webhookPort = port + 1
 
     let handler f : WebPart = fun (r : HttpContext) -> async {
           let data = r.request |> getResourceFromReq
@@ -64,67 +67,38 @@ let start (commands: Commands) (args: ParseResults<Options.CLIArguments>) =
             return! Response.response HttpCode.HTTP_200 res' r
         }
 
-    let echo notificationEvent (webSocket : Suave.WebSocket.WebSocket) =
+    let callWebHook endpoint (msg : string) =
+        let url = sprintf "http://localhost:%d/%s" webhookPort endpoint
+        let req = HttpWebRequest.Create url
+        req.Method <- "POST"
+        req.ContentType <- "application/json; charset=utf-8"
+        let postBytes = System.Text.Encoding.ASCII.GetBytes msg
+        req.ContentLength <- int64 postBytes.Length
+        async {
+            use! reqStream = req.GetRequestStreamAsync() |> Async.AwaitTask
+            do! reqStream.WriteAsync(postBytes, 0, postBytes.Length) |> Async.AwaitIAsyncResult |> Async.Ignore
+            reqStream.Close()
+            use! res = req.AsyncGetResponse()
+            use stream = res.GetResponseStream()
+            use reader = new StreamReader(stream)
+            let! rdata = reader.ReadToEndAsync() |> Async.AwaitTask
+            return rdata
+        }
 
-        let inline byteSegment array =
-#if SUAVE_2
-            Sockets.ByteSegment(array)
-#else
-            array
-#endif
-        let emptyBs =
-#if SUAVE_2
-            Sockets.ByteSegment.Empty
-#else
-            [||]
-#endif
-
-        fun _cx ->
-            let cts = new System.Threading.CancellationTokenSource()
-
-            let sendText (text: string) =
-                webSocket.send WebSocket.Opcode.Text (System.Text.Encoding.UTF8.GetBytes(text) |> byteSegment) true
-
-            // use a mailboxprocess to queue the send of notifications
-            let agent = MailboxProcessor.Start ((fun inbox ->
-                let rec messageLoop () = async {
-
-                    let! msg = inbox.Receive()
-
-                    let! _ = sendText msg
-
-                    return! messageLoop ()
-                    }
-
-                messageLoop ()
-                ), cts.Token)
-
-            let notifications =
-                notificationEvent
-                |> Observable.subscribe agent.Post
-
-            socket {
-
-                while not(cts.IsCancellationRequested) do
-                    let! msg = webSocket.read()
-                    match msg with
-                    | (WebSocket.Opcode.Ping, _, _) -> do! webSocket.send WebSocket.Opcode.Pong emptyBs true
-                    | (WebSocket.Opcode.Close, _, _) ->
-                        notifications.Dispose()
-                        cts.Cancel()
-                        do! webSocket.send WebSocket.Opcode.Close emptyBs true
-                    | _ -> ()
-                }
-
-    let notificationFor eventSelector =
-        commands.Notify |> Observable.choose eventSelector
+    commands.Notify
+    |> Event.add (function
+        | NotificationEvent.ParseError n ->
+            callWebHook "notifyErrors" n
+            |> Async.Ignore
+            |> Async.Start
+        | NotificationEvent.Workspace n ->
+            callWebHook "notifyWorkspace" n
+            |> Async.Ignore
+            |> Async.Start
+    )
 
     let app =
         choose [
-            path "/notify" >=>
-                WebSocket.handShake (echo (notificationFor (function NotificationEvent.ParseError n -> Some n | _ -> None)))
-            path "/notifyWorkspace" >=>
-                WebSocket.handShake (echo (notificationFor (function NotificationEvent.Workspace n -> Some n | _ -> None)))
             path "/parse" >=> handler (fun (data : ParseRequest) -> async {
                 let! res = commands.Parse data.FileName data.Lines data.Version
                 //Hack for tests
@@ -184,7 +158,6 @@ let start (commands: Commands) (args: ParseResults<Options.CLIArguments>) =
             path "/workspaceLoad" >=> handler (fun (data : WorkspaceLoadRequest) -> commands.WorkspaceLoad ignore (data.Files |> List.ofArray))
         ]
 
-    let port = args.GetResult (<@ Options.CLIArguments.Port @>, defaultValue = 8088)
 
     let defaultBinding = defaultConfig.bindings.[0]
     let withPort = { defaultBinding.socketBinding with port = uint16 port }
